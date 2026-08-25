@@ -1,0 +1,33 @@
+name: Bug report
+description: Report a reproducible JSON Fold problem
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Windows, macOS, Linux]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: JSON Fold version
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use synthetic JSON; remove secrets and personal data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+.venv/
+tests/_runtime*/
+.pytest_cache/
+.DS_Store
+pip-*/
