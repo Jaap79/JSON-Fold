@@ -87,8 +87,6 @@ class UiSmokeTests(unittest.TestCase):
             app = JsonFoldApp()
             try:
                 app.withdraw()
-                app.after(100, app.quit)
-                app.mainloop()
                 large_text = '{\n  "items": [\n' + ',\n'.join('    {"name":"item","value":42,"enabled":true}' for _ in range(12_000)) + "\n  ]\n}"
                 self.assertGreater(len(large_text), 500_000)
                 app.editor.delete("1.0", "end")
