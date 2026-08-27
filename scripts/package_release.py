@@ -9,7 +9,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT.parent
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SOURCE_DIRS = ("jsonfold", "tests", "assets", "scripts", ".github")
 SOURCE_FILES = ("pyproject.toml", "run_json_fold.py", "README.md", "CHANGELOG.md", "LICENSE", ".gitignore")
 

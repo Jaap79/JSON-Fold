@@ -13,11 +13,12 @@ The inspector explains the selected node, shows its JSONPath and exposes documen
 ## Features
 
 - Native cross-platform desktop UI built with Python/Tk; no Electron or web server.
-- Fully offline: no telemetry, network calls, uploads or remote schemas.
+- Offline-first: no telemetry, uploads, remote schemas or automatic network calls. The About dialog checks GitHub only on explicit request.
 - Lazy expandable/collapsible tree with key, value and type columns.
 - Editable source with undo/redo, syntax highlighting, line numbers and optional word wrap.
 - Inline editing for scalar values from the structure view.
-- Search across keys and scalar values, next/previous navigation and source highlights.
+- Search across keys and scalar values, with persistent Structure and Source highlights and view-aware next/previous navigation.
+- Jump directly to a 1-based line and optional character with `Ctrl+G`.
 - Persistent text marking for ad-hoc review.
 - Strict JSON parsing: rejects comments, trailing commas, `NaN` and infinities.
 - Duplicate-key warning; parsing follows common last-value-wins behavior.
@@ -29,7 +30,7 @@ The inspector explains the selected node, shows its JSONPath and exposes documen
   - macOS: `~/Library/Application Support/JSON Fold/settings.json`
   - Linux: `$XDG_CONFIG_HOME/json-fold/settings.json` or `~/.config/json-fold/settings.json`
 
-Syntax highlighting is intentionally paused above 2 MB while editing remains available. This prevents highlighting from monopolizing the UI on very large files. Tree expansion has a 20,000-node safety limit for “Expand all”; manual lazy navigation remains available.
+For files above 2 MB, syntax highlighting follows the visible viewport plus a buffer instead of styling the complete document. This keeps color schemes active without letting thousands of off-screen tags monopolize the UI. Tree expansion has a 20,000-node safety limit for “Expand all”; manual lazy navigation remains available.
 
 ## Run from source
 
@@ -46,6 +47,7 @@ python -m jsonfold path/to/file.json
 |---|---|
 | Open / Save | `Ctrl+O` / `Ctrl+S` |
 | Find | `Ctrl+F` |
+| Jump to line / character | `Ctrl+G` |
 | Structure / Source | `Ctrl+1` / `Ctrl+2` |
 | Apply source edits | `Ctrl+Enter` |
 | Format | `Ctrl+Shift+F` |
@@ -82,7 +84,7 @@ On Windows 10/11, JSON Fold explicitly recolors the native caption, title text a
 
 ## Security and privacy
 
-JSON Fold never evaluates document content, resolves URLs, loads external schemas or interprets keys as commands. Files remain local. Settings contain UI preferences and recent file paths only. Writes for normal Save operations use a same-directory temporary file followed by an atomic replace.
+JSON Fold never evaluates document content, resolves document URLs, loads external schemas or interprets keys as commands. Files remain local. Settings contain UI preferences and recent file paths only. Writes for normal Save operations use a same-directory temporary file followed by an atomic replace. The only network feature is a user-initiated request to GitHub's public Releases API from the About dialog; it sends no document content.
 
 Do not treat the viewer as a sanitizer: a JSON document can still contain secrets, malicious strings for downstream systems or extremely large/deep structures. Duplicate keys are reported because different consumers may interpret them differently.
 

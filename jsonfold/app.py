@@ -5,12 +5,16 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import queue
 import re
 import sys
+import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
+from urllib.parse import urlparse
+import webbrowser
 
 from . import __version__
 from .model import (
@@ -34,15 +38,14 @@ from .model import (
 )
 from .settings import SettingsStore
 from .theme import apply_theme, tokens
+from .updates import UpdateResult, check_for_updates
 
 
 APP_NAME = "JSON Fold"
 MAX_HIGHLIGHT_CHARS = 2_000_000
-TOKEN_RE = re.compile(
-    r'(?P<string>"(?:\\.|[^"\\])*")(?P<key>\s*:)?|'
-    r'(?P<number>-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)|'
-    r'(?P<boolean>\b(?:true|false)\b)|(?P<null>\bnull\b)'
-)
+MAX_SEARCH_HIGHLIGHTS = 5_000
+VIEWPORT_HIGHLIGHT_CHARS = 60_000
+NUMBER_RE = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
 
 WELCOME = {
     "welcome": "Open a JSON file or paste JSON from the clipboard.",
@@ -62,6 +65,50 @@ def format_bytes(size: int) -> str:
             return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
     return f"{value:.1f} GB"
+
+
+def iter_syntax_tokens(text: str) -> Iterator[tuple[str, int, int]]:
+    """Yield JSON token spans, including strings cut off at a viewport boundary."""
+    index = 0
+    length = len(text)
+    while index < length:
+        character = text[index]
+        if character == '"':
+            start = index
+            index += 1
+            escaped = False
+            closed = False
+            while index < length:
+                current = text[index]
+                if escaped:
+                    escaped = False
+                elif current == "\\":
+                    escaped = True
+                elif current == '"':
+                    index += 1
+                    closed = True
+                    break
+                index += 1
+            lookahead = index
+            while closed and lookahead < length and text[lookahead].isspace():
+                lookahead += 1
+            yield ("key" if closed and lookahead < length and text[lookahead] == ":" else "string", start, index)
+            continue
+        if character == "-" or character.isdigit():
+            number = NUMBER_RE.match(text, index)
+            if number:
+                yield "number", index, number.end()
+                index = number.end()
+                continue
+        matched_literal = False
+        for literal, tag in (("true", "boolean"), ("false", "boolean"), ("null", "null")):
+            if text.startswith(literal, index):
+                yield tag, index, index + len(literal)
+                index += len(literal)
+                matched_literal = True
+                break
+        if not matched_literal:
+            index += 1
 
 
 class PopupMenu:
@@ -200,8 +247,14 @@ class JsonFoldApp(tk.Tk):
         self.path_nodes: dict[tuple[str | int, ...], str] = {}
         self.node_jsonpaths: dict[str, str] = {}
         self.search_matches: list[tuple[str | int, ...]] = []
+        self.search_match_set: set[tuple[str | int, ...]] = set()
+        self.search_ancestor_set: set[tuple[str | int, ...]] = set()
         self.search_index = -1
+        self.source_search_ranges: list[tuple[str, str]] = []
+        self.source_search_index = -1
+        self.search_job: str | None = None
         self.highlight_job: str | None = None
+        self.highlighted_range: tuple[str, str] | None = None
         self._build_ui()
         self.editor.configure(wrap="word" if self.settings["word_wrap"] else "none")
         if not self.settings["show_line_numbers"]:
@@ -209,7 +262,7 @@ class JsonFoldApp(tk.Tk):
         self._bind_shortcuts()
         self._load_document(WELCOME, self.source_snapshot, None, ParseResult(WELCOME, collect_stats(WELCOME)))
         self.protocol("WM_DELETE_WINDOW", self.close_app)
-        self.after(80, self._apply_current_theme)
+        self.initial_theme_job: str | None = self.after(80, self._apply_current_theme)
         if initial_path:
             self.after(120, lambda: self.open_path(initial_path))
 
@@ -326,6 +379,7 @@ class JsonFoldApp(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<Double-1>", lambda _e: self.edit_selected_value())
         self.tree.bind("<Return>", lambda _e: self._toggle_selected())
+        self.tree.tag_configure("contains_match", foreground=self.colors["accent_hover"])
         self.tree.tag_configure("match", background=self.colors["surface_alt"], foreground=self.colors["accent"])
 
     def _build_editor(self) -> None:
@@ -343,7 +397,7 @@ class JsonFoldApp(tk.Tk):
         self.editor.bind("<<Modified>>", self._on_editor_modified)
         self.editor.bind("<KeyRelease>", lambda _e: self._update_cursor())
         self.editor.bind("<ButtonRelease-1>", lambda _e: self._update_cursor())
-        for tag in ("key", "string", "number", "boolean", "null", "search", "marked", "error"):
+        for tag in ("key", "string", "number", "boolean", "null", "search", "marked", "error", "jump_line", "jump_char"):
             self.editor.tag_configure(tag)
 
     def _build_inspector(self) -> None:
@@ -385,7 +439,7 @@ class JsonFoldApp(tk.Tk):
         self._show_menu(2, [("Structure", "Ctrl+1", lambda: self.notebook.select(self.structure_tab)), ("Source", "Ctrl+2", lambda: self.notebook.select(self.source_tab)), ("-", "", None), ("Expand all", "Ctrl++", self.expand_all), ("Collapse all", "Ctrl+-", self.collapse_all), (wrap_label, "Alt+Z", self.toggle_word_wrap), ("-", "", None), ("Toggle theme", "Ctrl+T", self.toggle_theme)])
 
     def _tools_menu(self) -> None:
-        self._show_menu(3, [("Format document", "Ctrl+Shift+F", self.format_document), ("Copy JSONPath", "Ctrl+Shift+C", self.copy_json_path), ("Copy selected value", "Ctrl+Shift+X", self.copy_selected_value), ("-", "", None), ("Settings…", "Ctrl+,", self.show_settings), ("Export settings…", "", self.export_settings), ("Import settings…", "", self.import_settings)])
+        self._show_menu(3, [("Format document", "Ctrl+Shift+F", self.format_document), ("Jump to line / character…", "Ctrl+G", self.show_jump_dialog), ("Copy JSONPath", "Ctrl+Shift+C", self.copy_json_path), ("Copy selected value", "Ctrl+Shift+X", self.copy_selected_value), ("-", "", None), ("Settings…", "Ctrl+,", self.show_settings), ("Export settings…", "", self.export_settings), ("Import settings…", "", self.import_settings)])
 
     def _help_menu(self) -> None:
         self._show_menu(4, [("JSON quick guide", "F1", self.show_json_guide), ("Keyboard shortcuts", "", self.show_shortcuts), ("-", "", None), (f"About {APP_NAME}", "", self.show_about)])
@@ -573,7 +627,12 @@ class JsonFoldApp(tk.Tk):
 
     def _insert_node(self, parent: str, key: str, value: JSON, path: tuple[str | int, ...], jsonpath: str) -> str:
         node_type = json_type(value)
-        iid = self.tree.insert(parent, "end", text=key, values=(value_preview(value), node_type), tags=(node_type,))
+        tags = [node_type]
+        if path in self.search_match_set:
+            tags.append("match")
+        elif path in self.search_ancestor_set:
+            tags.append("contains_match")
+        iid = self.tree.insert(parent, "end", text=key, values=(value_preview(value), node_type), tags=tuple(tags))
         self.node_paths[iid] = path
         self.path_nodes[path] = iid
         self.node_jsonpaths[iid] = jsonpath
@@ -686,81 +745,175 @@ class JsonFoldApp(tk.Tk):
 
     # --- Search and highlighting ----------------------------------------
     def _on_search_changed(self, _event: tk.Event[Any] | None = None) -> None:
-        self.after(120, self.run_search)
+        if self.search_job:
+            self.after_cancel(self.search_job)
+        self.search_job = self.after(140, self.run_search)
 
-    def run_search(self) -> None:
-        query = self.search_var.get()
+    def _tree_search_tags(self, path: tuple[str | int, ...], existing: tuple[str, ...]) -> tuple[str, ...]:
+        tags = [tag for tag in existing if tag not in {"match", "contains_match"}]
+        if path in self.search_match_set:
+            tags.append("match")
+        elif path in self.search_ancestor_set:
+            tags.append("contains_match")
+        return tuple(tags)
+
+    def _refresh_tree_search_tags(self) -> None:
+        self.tree.tag_configure("contains_match", foreground=self.colors["accent_hover"])
+        self.tree.tag_configure("match", background=self.colors["surface_alt"], foreground=self.colors["accent"])
+        for iid, path in self.node_paths.items():
+            self.tree.item(iid, tags=self._tree_search_tags(path, tuple(self.tree.item(iid, "tags"))))
+
+    def _highlight_source_search(self, query: str) -> None:
         self.editor.tag_remove("search", "1.0", "end")
         self.editor.tag_configure("search", background=self.colors["accent"], foreground=self.colors["on_accent"])
-        for iid in self.node_paths:
-            tags = tuple(tag for tag in self.tree.item(iid, "tags") if tag != "match")
-            self.tree.item(iid, tags=tags)
+        self.source_search_ranges = []
+        self.source_search_index = -1
+        if not query:
+            return
+        start = "1.0"
+        while len(self.source_search_ranges) < MAX_SEARCH_HIGHLIGHTS:
+            found = self.editor.search(query, start, stopindex="end-1c", nocase=True)
+            if not found:
+                break
+            end = self.editor.index(f"{found}+{len(query)}c")
+            self.editor.tag_add("search", found, end)
+            self.source_search_ranges.append((found, end))
+            start = end
+
+    def run_search(self) -> None:
+        self.search_job = None
+        query = self.search_var.get().strip()
+        self._highlight_source_search(query)
         if not query:
             self.search_matches = []
+            self.search_match_set.clear()
+            self.search_ancestor_set.clear()
             self.search_index = -1
             self.search_count.configure(text="")
+            self._refresh_tree_search_tags()
             return
         self.search_matches = search_node_paths(self.document, query)
+        self.search_match_set = set(self.search_matches)
+        self.search_ancestor_set = {
+            path[:depth]
+            for path in self.search_matches
+            for depth in range(len(path))
+        }
         self.search_index = -1
-        start = "1.0"
-        source = self.editor.get("1.0", "end-1c")
-        if len(source) <= MAX_HIGHLIGHT_CHARS:
-            while True:
-                found = self.editor.search(query, start, stopindex="end", nocase=True)
-                if not found:
-                    break
-                end = f"{found}+{len(query)}c"
-                self.editor.tag_add("search", found, end)
-                start = end
-        self.search_count.configure(text=f"{len(self.search_matches)} found")
+        self._refresh_tree_search_tags()
+        self._update_search_count()
         if self.search_matches:
-            self.next_match()
+            self._select_structure_match(0)
+        self._status(
+            f"Search: {len(self.search_matches)} structure result(s), "
+            f"{len(self.source_search_ranges)} source highlight(s)"
+            + (f" (first {MAX_SEARCH_HIGHLIGHTS})" if len(self.source_search_ranges) == MAX_SEARCH_HIGHLIGHTS else "")
+        )
+
+    def _source_tab_active(self) -> bool:
+        return self.notebook.select() == str(self.source_tab)
+
+    def _update_search_count(self) -> None:
+        if not self.search_var.get().strip():
+            self.search_count.configure(text="")
+        elif self._source_tab_active():
+            total = len(self.source_search_ranges)
+            current = self.source_search_index + 1 if self.source_search_index >= 0 else 0
+            self.search_count.configure(text=f"{current}/{total}" if total else "0 found")
+        else:
+            total = len(self.search_matches)
+            current = self.search_index + 1 if self.search_index >= 0 else 0
+            self.search_count.configure(text=f"{current}/{total}" if total else "0 found")
 
     def next_match(self) -> None:
+        if self._source_tab_active():
+            self._select_source_match(self.source_search_index + 1)
+            return
         if not self.search_matches:
             return
-        self.search_index = (self.search_index + 1) % len(self.search_matches)
-        self._select_match()
+        self._select_structure_match(self.search_index + 1)
 
     def previous_match(self) -> None:
+        if self._source_tab_active():
+            self._select_source_match(self.source_search_index - 1)
+            return
         if not self.search_matches:
             return
-        self.search_index = (self.search_index - 1) % len(self.search_matches)
-        self._select_match()
+        self._select_structure_match(self.search_index - 1)
 
-    def _select_match(self) -> None:
+    def _select_structure_match(self, index: int) -> None:
+        if not self.search_matches:
+            self._update_search_count()
+            return
+        self.search_index = index % len(self.search_matches)
         path = self.search_matches[self.search_index]
         iid = self._ensure_node(path)
         if iid:
-            tags = tuple(self.tree.item(iid, "tags")) + ("match",)
-            self.tree.item(iid, tags=tags)
             self.tree.selection_set(iid)
             self.tree.focus(iid)
             self.tree.see(iid)
-        self.search_count.configure(text=f"{self.search_index + 1}/{len(self.search_matches)}")
+        self._update_search_count()
+
+    def _select_source_match(self, index: int) -> None:
+        if not self.source_search_ranges:
+            self._update_search_count()
+            return
+        self.source_search_index = index % len(self.source_search_ranges)
+        first, last = self.source_search_ranges[self.source_search_index]
+        self.editor.mark_set("insert", first)
+        self.editor.see(first)
+        self.editor.tag_remove("sel", "1.0", "end")
+        self.editor.tag_add("sel", first, last)
+        self.editor.focus_set()
+        self._update_cursor()
+        self._update_search_count()
 
     def _schedule_highlight(self) -> None:
         if self.highlight_job:
             self.after_cancel(self.highlight_job)
-        self.highlight_job = self.after(180, self._highlight_source)
+        self.highlight_job = self.after(180, self._run_scheduled_highlight)
+
+    def _run_scheduled_highlight(self) -> None:
+        self.highlight_job = None
+        self._highlight_source()
+
+    def _editor_char_count(self, start: str, end: str) -> int:
+        result = self.editor.count(start, end, "chars")
+        return int(result[0]) if result else 0
 
     def _highlight_source(self) -> None:
-        self.highlight_job = None
-        text = self.editor.get("1.0", "end-1c")
+        char_count = self._editor_char_count("1.0", "end-1c")
         for tag in ("key", "string", "number", "boolean", "null"):
-            self.editor.tag_remove(tag, "1.0", "end")
-        if len(text) > MAX_HIGHLIGHT_CHARS:
-            self._status(f"Syntax highlighting paused above {format_bytes(MAX_HIGHLIGHT_CHARS)}; editing remains available")
-            return
-        for match in TOKEN_RE.finditer(text):
-            tag = match.lastgroup
-            if tag == "string" and match.group("key"):
-                tag = "key"
-            if not tag:
+            if self.highlighted_range:
+                self.editor.tag_remove(tag, *self.highlighted_range)
+            else:
+                self.editor.tag_remove(tag, "1.0", "end")
+        start, end = "1.0", "end-1c"
+        scan_start = start
+        if char_count > MAX_HIGHLIGHT_CHARS:
+            top = self.editor.index("@0,0")
+            bottom = self.editor.index(f"@0,{max(self.editor.winfo_height() - 1, 1)}")
+            start = self.editor.index(f"{top}-40lines linestart")
+            end = self.editor.index(f"{bottom}+40lines lineend")
+            visible_chars = self._editor_char_count(start, end)
+            if visible_chars > VIEWPORT_HIGHLIGHT_CHARS:
+                start = self.editor.index(f"{top}-{VIEWPORT_HIGHLIGHT_CHARS // 4}c")
+                end = self.editor.index(f"{top}+{VIEWPORT_HIGHLIGHT_CHARS * 3 // 4}c")
+            # A large minified document can be one physical line. Scan from its
+            # beginning to retain string state, but only tag the viewport range.
+            scan_start = self.editor.index(f"{start} linestart")
+        text = self.editor.get(scan_start, end)
+        visible_offset = self._editor_char_count(scan_start, start)
+        visible_length = self._editor_char_count(start, end)
+        self.highlighted_range = (start, end)
+        for tag, token_start_offset, token_end_offset in iter_syntax_tokens(text):
+            clipped_start = max(token_start_offset, visible_offset)
+            clipped_end = min(token_end_offset, visible_offset + visible_length)
+            if clipped_start >= clipped_end:
                 continue
-            start = f"1.0+{match.start()}c"
-            end = f"1.0+{match.end('string') if match.lastgroup == 'string' else match.end()}c"
-            self.editor.tag_add(tag, start, end)
+            token_start = f"{scan_start}+{clipped_start}c"
+            token_end = f"{scan_start}+{clipped_end}c"
+            self.editor.tag_add(tag, token_start, token_end)
         for tag in ("key", "string", "number", "boolean", "null"):
             self.editor.tag_configure(tag, foreground=self.colors[tag])
 
@@ -789,10 +942,13 @@ class JsonFoldApp(tk.Tk):
     def _editor_yview(self, *args: Any) -> None:
         self.editor.yview(*args)
         self.line_numbers.redraw(self.colors)
+        self._schedule_highlight()
 
     def _on_editor_scroll(self, first: str, last: str, scrollbar: ttk.Scrollbar) -> None:
         scrollbar.set(first, last)
         self.line_numbers.redraw(self.colors)
+        if self._editor_char_count("1.0", "end-1c") > MAX_HIGHLIGHT_CHARS:
+            self._schedule_highlight()
 
     def _update_cursor(self) -> None:
         line, column = self.editor.index("insert").split(".")
@@ -808,8 +964,10 @@ class JsonFoldApp(tk.Tk):
     def _sync_active_tab(self) -> None:
         if self.notebook.select() == str(self.source_tab):
             self._update_cursor()
+            self._schedule_highlight()
         else:
             self.position_text.configure(text="")
+        self._update_search_count()
 
     # --- Inspector -------------------------------------------------------
     def _show_inspection(self, path: str, value: JSON) -> None:
@@ -872,6 +1030,7 @@ class JsonFoldApp(tk.Tk):
         self.learn_title.configure(bg=self.colors["surface_alt"], fg=self.colors["accent"])
         self.learn_text.configure(bg=self.colors["surface_alt"], fg=self.colors["text"])
         self._draw_logo()
+        self._refresh_tree_search_tags()
         self._retint_custom_widgets(self)
         self._highlight_source()
         self.line_numbers.redraw(self.colors)
@@ -971,11 +1130,38 @@ class JsonFoldApp(tk.Tk):
         InfoDialog(self, "JSON quick guide", text)
 
     def show_shortcuts(self) -> None:
-        text = "Ctrl+O  Open\nCtrl+S  Save\nCtrl+F  Find\nCtrl+1 / Ctrl+2  Structure / Source\nCtrl+Enter  Apply source edits\nCtrl+Shift+F  Format\nCtrl+T  Toggle theme\nAlt+Z  Word wrap\nF2  Edit selected scalar\nEscape  Close popup/dialog"
+        text = "Ctrl+O  Open\nCtrl+S  Save\nCtrl+F  Find\nCtrl+G  Jump to line / character\nCtrl+1 / Ctrl+2  Structure / Source\nCtrl+Enter  Apply source edits\nCtrl+Shift+F  Format\nCtrl+T  Toggle theme\nAlt+Z  Word wrap\nF2  Edit selected scalar\nEscape  Close popup/dialog"
         InfoDialog(self, "Keyboard shortcuts", text)
 
     def show_about(self) -> None:
-        InfoDialog(self, f"About {APP_NAME}", f"JSON Fold {__version__}\n\nA fast, offline JSON viewer and editor.\nBuilt with the Python standard library.\nNo telemetry. No network access.\n\nSettings:\n{self.settings_store.path}")
+        AboutDialog(self)
+
+    def show_jump_dialog(self) -> None:
+        JumpDialog(self)
+
+    def jump_to_position(self, line: int, character: int | None = None) -> None:
+        last_line = int(self.editor.index("end-1c").split(".")[0])
+        if line < 1 or line > last_line:
+            raise ValueError(f"Line must be between 1 and {last_line}.")
+        line_text = self.editor.get(f"{line}.0", f"{line}.0 lineend")
+        actual_character = 1 if character is None else character
+        if actual_character < 1 or actual_character > len(line_text) + 1:
+            raise ValueError(f"Character must be between 1 and {len(line_text) + 1} on line {line}.")
+        index = f"{line}.{actual_character - 1}"
+        self.notebook.select(self.source_tab)
+        self.editor.mark_set("insert", index)
+        self.editor.see(index)
+        self.editor.focus_set()
+        self.editor.tag_remove("jump_line", "1.0", "end")
+        self.editor.tag_remove("jump_char", "1.0", "end")
+        self.editor.tag_configure("jump_line", background=self.colors["surface_alt"])
+        self.editor.tag_configure("jump_char", background=self.colors["accent"], foreground=self.colors["on_accent"])
+        self.editor.tag_add("jump_line", f"{line}.0", f"{line}.0 lineend")
+        if actual_character <= len(line_text):
+            self.editor.tag_add("jump_char", index, f"{index}+1c")
+        self.after(1800, lambda: (self.editor.tag_remove("jump_line", "1.0", "end"), self.editor.tag_remove("jump_char", "1.0", "end")))
+        self._update_cursor()
+        self._status(f"Jumped to line {line}, character {actual_character}")
 
     def _show_error(self, title: str, text: str) -> None:
         messagebox.showerror(title, text, parent=self)
@@ -995,10 +1181,14 @@ class JsonFoldApp(tk.Tk):
             "<Control-Key-1>": lambda: self.notebook.select(self.structure_tab), "<Control-Key-2>": lambda: self.notebook.select(self.source_tab),
             "<Control-Return>": self.apply_source, "<Control-Shift-F>": self.format_document, "<Alt-z>": self.toggle_word_wrap,
             "<F2>": self.edit_selected_value, "<F1>": self.show_json_guide, "<Control-comma>": self.show_settings,
-            "<Control-h>": self.mark_selection, "<Control-Key-0>": self.clear_marks,
+            "<Control-h>": self.mark_selection, "<Control-Key-0>": self.clear_marks, "<Control-g>": self.show_jump_dialog,
         }
         for sequence, command in bindings.items():
-            self.bind_all(sequence, lambda _e, cmd=command: (cmd(), "break")[1])
+            handler = lambda _e, cmd=command: (cmd(), "break")[1]
+            self.bind_all(sequence, handler)
+            # Text class bindings include actions such as Ctrl+T transpose. Bind
+            # application shortcuts at widget level so those edits never run first.
+            self.editor.bind(sequence, handler)
         for sequence, command in (("<Alt-f>", self._file_menu), ("<Alt-e>", self._edit_menu), ("<Alt-v>", self._view_menu), ("<Alt-t>", self._tools_menu), ("<Alt-h>", self._help_menu)):
             self.bind_all(sequence, lambda _e, cmd=command: (cmd(), "break")[1])
 
@@ -1037,6 +1227,17 @@ class JsonFoldApp(tk.Tk):
         self.settings["window"]["height"] = self.winfo_height()
         self.settings_store.save()
         self.destroy()
+
+    def destroy(self) -> None:
+        for attribute in ("search_job", "highlight_job", "initial_theme_job"):
+            job = getattr(self, attribute, None)
+            if job:
+                try:
+                    self.after_cancel(job)
+                except tk.TclError:
+                    pass
+                setattr(self, attribute, None)
+        super().destroy()
 
 
 class BaseDialog(tk.Toplevel):
@@ -1121,6 +1322,115 @@ class SettingsDialog(BaseDialog):
         self.owner.settings["sort_keys"] = self.sort.get()
         self.applied = True
         self.destroy()
+
+
+class JumpDialog(BaseDialog):
+    def __init__(self, owner: JsonFoldApp) -> None:
+        super().__init__(owner, "Jump to line / character", 460, 260)
+        tk.Label(self, text="JUMP TO POSITION", bg=owner.colors["surface"], fg=owner.colors["accent"], font=("Segoe UI Semibold", 10)).pack(anchor="w", padx=18, pady=(18, 6))
+        tk.Label(self, text="Line is required. Character is optional and starts at 1.", bg=owner.colors["surface"], fg=owner.colors["text_muted"], font=("Segoe UI", 9)).pack(anchor="w", padx=18)
+        form = tk.Frame(self, bg=owner.colors["surface"])
+        form.pack(fill="x", padx=18, pady=16)
+        self.line = tk.StringVar(value=self._current_line(owner))
+        self.character = tk.StringVar()
+        tk.Label(form, text="Line", bg=owner.colors["surface"], fg=owner.colors["text"], font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w", pady=6)
+        tk.Label(form, text="Character", bg=owner.colors["surface"], fg=owner.colors["text"], font=("Segoe UI", 9)).grid(row=1, column=0, sticky="w", pady=6)
+        self.line_entry = ttk.Entry(form, textvariable=self.line, width=18)
+        self.character_entry = ttk.Entry(form, textvariable=self.character, width=18)
+        self.line_entry.grid(row=0, column=1, sticky="ew", padx=(28, 0), pady=6)
+        self.character_entry.grid(row=1, column=1, sticky="ew", padx=(28, 0), pady=6)
+        form.columnconfigure(1, weight=1)
+        self.error = tk.Label(self, text="", bg=owner.colors["surface"], fg=owner.colors["danger"], font=("Segoe UI", 8), anchor="w")
+        self.error.pack(fill="x", padx=18)
+        buttons = tk.Frame(self, bg=owner.colors["surface"])
+        buttons.pack(side="bottom", fill="x", padx=18, pady=16)
+        owner._plain_button(buttons, "Cancel", self.destroy).pack(side="right", padx=(4, 0))
+        owner._plain_button(buttons, "Jump", self.apply, accent=True).pack(side="right")
+        self.line_entry.bind("<Return>", lambda _e: self.apply())
+        self.character_entry.bind("<Return>", lambda _e: self.apply())
+        self.line_entry.focus_set()
+        self.line_entry.selection_range(0, "end")
+
+    @staticmethod
+    def _current_line(owner: JsonFoldApp) -> str:
+        try:
+            return owner.editor.index("insert").split(".")[0]
+        except tk.TclError:
+            return "1"
+
+    def apply(self) -> None:
+        try:
+            line = int(self.line.get().strip())
+            character_text = self.character.get().strip()
+            character = int(character_text) if character_text else None
+            self.owner.jump_to_position(line, character)
+        except ValueError as error:
+            self.error.configure(text=str(error))
+            return
+        self.destroy()
+
+
+class AboutDialog(BaseDialog):
+    def __init__(self, owner: JsonFoldApp) -> None:
+        super().__init__(owner, f"About {APP_NAME}", 560, 390)
+        self.results: queue.Queue[UpdateResult] = queue.Queue()
+        self.release_url = ""
+        tk.Label(self, text="JSON FOLD", bg=owner.colors["surface"], fg=owner.colors["accent"], font=("Segoe UI Semibold", 12)).pack(anchor="w", padx=18, pady=(18, 2))
+        tk.Label(self, text=f"Version {__version__}", bg=owner.colors["surface"], fg=owner.colors["text_muted"], font=("Cascadia Mono", 9)).pack(anchor="w", padx=18)
+        body = (
+            "A fast, offline-first JSON viewer and editor.\n"
+            "Built with the Python standard library.\n\n"
+            "No telemetry. No automatic network traffic. JSON Fold connects to "
+            "api.github.com only when you explicitly check for updates."
+        )
+        tk.Label(self, text=body, justify="left", anchor="nw", wraplength=510, bg=owner.colors["surface"], fg=owner.colors["text"], font=("Segoe UI", 9)).pack(fill="x", padx=18, pady=(16, 14))
+        panel = tk.Frame(self, bg=owner.colors["surface_alt"], highlightbackground=owner.colors["border"], highlightthickness=1)
+        panel.pack(fill="x", padx=18)
+        self.update_status = tk.Label(panel, text="Update status has not been checked.", justify="left", anchor="w", wraplength=470, bg=owner.colors["surface_alt"], fg=owner.colors["text_muted"], font=("Segoe UI", 9))
+        self.update_status.pack(fill="x", padx=12, pady=(11, 7))
+        update_buttons = tk.Frame(panel, bg=owner.colors["surface_alt"])
+        update_buttons.pack(fill="x", padx=10, pady=(0, 10))
+        self.check_button = owner._plain_button(update_buttons, "Check for updates…", self.check)
+        self.check_button.pack(side="left")
+        self.release_button = owner._plain_button(update_buttons, "Open release", self.open_release)
+        self.release_button.configure(state="disabled")
+        self.release_button.pack(side="left", padx=6)
+        footer = tk.Frame(self, bg=owner.colors["surface"])
+        footer.pack(side="bottom", fill="x", padx=18, pady=16)
+        owner._plain_button(footer, "Close", self.destroy, accent=True).pack(side="right")
+        tk.Label(self, text=f"Settings: {owner.settings_store.path}", justify="left", anchor="w", wraplength=510, bg=owner.colors["surface"], fg=owner.colors["text_muted"], font=("Cascadia Mono", 8)).pack(side="bottom", fill="x", padx=18)
+
+    def check(self) -> None:
+        self.check_button.configure(state="disabled")
+        self.release_button.configure(state="disabled")
+        self.update_status.configure(text="Checking GitHub…", fg=self.owner.colors["text"])
+        threading.Thread(target=self._check_worker, daemon=True).start()
+        self.after(80, self._poll_result)
+
+    def _check_worker(self) -> None:
+        self.results.put(check_for_updates(__version__))
+
+    def _poll_result(self) -> None:
+        try:
+            result = self.results.get_nowait()
+        except queue.Empty:
+            self.after(80, self._poll_result)
+            return
+        self.check_button.configure(state="normal")
+        color = self.owner.colors["good"] if result.status in {"available", "current"} else self.owner.colors["warning"] if result.status == "no_release" else self.owner.colors["danger"]
+        self.update_status.configure(text=result.message, fg=color)
+        self.release_url = result.html_url
+        if result.status == "available" and self._valid_release_url(self.release_url):
+            self.release_button.configure(state="normal")
+
+    @staticmethod
+    def _valid_release_url(url: str) -> bool:
+        parsed = urlparse(url)
+        return parsed.scheme == "https" and parsed.hostname in {"github.com", "www.github.com"}
+
+    def open_release(self) -> None:
+        if self._valid_release_url(self.release_url):
+            webbrowser.open(self.release_url)
 
 
 class InfoDialog(BaseDialog):
