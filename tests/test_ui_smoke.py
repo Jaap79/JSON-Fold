@@ -81,14 +81,14 @@ class UiSmokeTests(unittest.TestCase):
         directory.mkdir(exist_ok=True)
         with (
             patch("jsonfold.app.SettingsStore", lambda: SettingsStore(directory)),
-            patch("jsonfold.app.MAX_HIGHLIGHT_CHARS", 200_000),
-            patch("jsonfold.app.VIEWPORT_HIGHLIGHT_CHARS", 60_000),
+            patch("jsonfold.app.MAX_HIGHLIGHT_CHARS", 2_000),
+            patch("jsonfold.app.VIEWPORT_HIGHLIGHT_CHARS", 600),
         ):
             app = JsonFoldApp()
             try:
                 app.withdraw()
-                large_text = '{\n  "items": [\n' + ',\n'.join('    {"name":"item","value":42,"enabled":true}' for _ in range(12_000)) + "\n  ]\n}"
-                self.assertGreater(len(large_text), 500_000)
+                large_text = '{\n  "items": [\n' + ',\n'.join('    {"name":"item","value":42,"enabled":true}' for _ in range(120)) + "\n  ]\n}"
+                self.assertGreater(len(large_text), 5_000)
                 app.editor.delete("1.0", "end")
                 app.editor.insert("1.0", large_text)
                 app.highlighted_range = None
@@ -100,7 +100,7 @@ class UiSmokeTests(unittest.TestCase):
                 app.settings["color_scheme"] = "colorblind"
                 app._apply_current_theme()
                 self.assertNotEqual(app.editor.tag_cget("string", "foreground"), original)
-                one_line = '{"blob":"' + ("x" * 520_000) + '"}'
+                one_line = '{"blob":"' + ("x" * 5_200) + '"}'
                 app.editor.delete("1.0", "end")
                 app.editor.insert("1.0", one_line)
                 app.highlighted_range = None
