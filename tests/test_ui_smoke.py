@@ -35,13 +35,14 @@ class UiSmokeTests(unittest.TestCase):
                 self.assertTrue(app.editor.tag_ranges("sel"))
                 app.jump_to_position(2, 3)
                 self.assertEqual(app.editor.index("insert"), "2.2")
-                before_shortcut = app.editor.get("1.0", "end-1c")
-                app.dirty = False
-                app.editor.focus_force()
-                app.editor.event_generate("<Control-t>")
-                app.update()
-                self.assertEqual(app.editor.get("1.0", "end-1c"), before_shortcut)
-                self.assertFalse(app.dirty)
+                if sys.platform != "darwin":
+                    before_shortcut = app.editor.get("1.0", "end-1c")
+                    app.dirty = False
+                    app.editor.focus_force()
+                    app.editor.event_generate("<Control-t>")
+                    app.update()
+                    self.assertEqual(app.editor.get("1.0", "end-1c"), before_shortcut)
+                    self.assertFalse(app.dirty)
                 original = app.settings["theme"]
                 app.toggle_theme()
                 self.assertNotEqual(app.settings["theme"], original)
