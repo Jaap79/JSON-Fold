@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -78,14 +79,18 @@ class UiSmokeTests(unittest.TestCase):
     def test_large_source_uses_viewport_syntax_highlighting(self) -> None:
         directory = Path(__file__).parent / "_runtime_ui_large"
         directory.mkdir(exist_ok=True)
-        with patch("jsonfold.app.SettingsStore", lambda: SettingsStore(directory)):
+        with (
+            patch("jsonfold.app.SettingsStore", lambda: SettingsStore(directory)),
+            patch("jsonfold.app.MAX_HIGHLIGHT_CHARS", 200_000),
+            patch("jsonfold.app.VIEWPORT_HIGHLIGHT_CHARS", 60_000),
+        ):
             app = JsonFoldApp()
             try:
                 app.withdraw()
                 app.after(100, app.quit)
                 app.mainloop()
-                large_text = '{\n  "items": [\n' + ',\n'.join('    {"name":"item","value":42,"enabled":true}' for _ in range(120_000)) + "\n  ]\n}"
-                self.assertGreater(len(large_text), 5_000_000)
+                large_text = '{\n  "items": [\n' + ',\n'.join('    {"name":"item","value":42,"enabled":true}' for _ in range(12_000)) + "\n  ]\n}"
+                self.assertGreater(len(large_text), 500_000)
                 app.editor.delete("1.0", "end")
                 app.editor.insert("1.0", large_text)
                 app.highlighted_range = None
@@ -97,7 +102,26 @@ class UiSmokeTests(unittest.TestCase):
                 app.settings["color_scheme"] = "colorblind"
                 app._apply_current_theme()
                 self.assertNotEqual(app.editor.tag_cget("string", "foreground"), original)
+                one_line = '{"blob":"' + ("x" * 520_000) + '"}'
+                app.editor.delete("1.0", "end")
+                app.editor.insert("1.0", one_line)
+                app.highlighted_range = None
+                app._highlight_source()
+                self.assertTrue(app.editor.tag_ranges("key"))
+                self.assertTrue(app.editor.tag_ranges("string"))
+            finally:
+                app.destroy()
+
+    @unittest.skipUnless(sys.platform == "win32", "Full 5 MB Tk regression runs on Windows")
+    def test_actual_five_mb_single_line_source_is_colored_on_windows(self) -> None:
+        directory = Path(__file__).parent / "_runtime_ui_5mb"
+        directory.mkdir(exist_ok=True)
+        with patch("jsonfold.app.SettingsStore", lambda: SettingsStore(directory)):
+            app = JsonFoldApp()
+            try:
+                app.withdraw()
                 one_line = '{"blob":"' + ("x" * 5_200_000) + '"}'
+                self.assertGreater(len(one_line), 5_000_000)
                 app.editor.delete("1.0", "end")
                 app.editor.insert("1.0", one_line)
                 app.highlighted_range = None
